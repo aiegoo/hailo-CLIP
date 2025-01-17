@@ -28,14 +28,11 @@ def get_pipeline(self):
     POSTPROCESS_DIR = self.tappas_postprocess_dir
     hailopython_path = os.path.join(self.current_path, "clip_app/clip_hailopython.py")
     if self.detector == "fast_sam":
-        # FASTSAM
-        # DETECTION_HEF_PATH = os.path.join(RESOURCES_DIR, "fast_sam_s.hef")
         DETECTION_HEF_PATH = os.path.join(RESOURCES_DIR, "yolov8s_fastsam_single_context.hef")
         DETECTION_POST = os.path.join(RESOURCES_DIR, "libfastsam_post.so")
         DETECTION_POST_PIPE = f'hailofilter so-path={DETECTION_POST} qos=false '
         hef_path = DETECTION_HEF_PATH
     else:
-        # personface
         YOLO5_POSTPROCESS_SO = os.path.join(POSTPROCESS_DIR, "libyolo_post.so")
         YOLO5_NETWORK_NAME = "yolov5_personface_letterbox"
         YOLO5_HEF_PATH = os.path.join(RESOURCES_DIR, YOLO5_HEF_NAME)
@@ -43,7 +40,6 @@ def get_pipeline(self):
         DETECTION_POST_PIPE = f'hailofilter so-path={YOLO5_POSTPROCESS_SO} qos=false function_name={YOLO5_NETWORK_NAME} config-path={YOLO5_CONFIG_PATH} '
         hef_path = YOLO5_HEF_PATH
 
-    # CLIP
     clip_hef_path = os.path.join(RESOURCES_DIR, CLIP_HEF_NAME)
     clip_postprocess_so = os.path.join(RESOURCES_DIR, "libclip_post.so")
     DEFAULT_CROP_SO = os.path.join(RESOURCES_DIR, "libclip_croppers.so")
@@ -63,12 +59,20 @@ def get_pipeline(self):
         probe_tee. ! {QUEUE()}'
 
     RATE_PIPELINE = f' {QUEUE()} name=rate_queue ! video/x-raw, framerate=30/1 '
-    # Check if the input seems like a v4l2 device path (e.g., /dev/video0)
-    sync = False # sync_req is relevant only when working with video files
-    if re.match(r'/dev/video\d+', self.input_uri):
+
+    # Use libcamerasrc for input
+    sync = False  # sync_req is relevant only when working with video files
+    # Updated pipeline for libcamerasrc
+    if self.input_uri == "libcamera":
+        SOURCE_PIPELINE = (
+            f'libcamerasrc ! video/x-raw,format=RGB,width={RES_X},height={RES_Y},framerate=30/1 ! '
+            f'videoconvert ! videoscale ! video/x-raw,format=RGB,width={RES_X},height={RES_Y} ! '
+            f'{QUEUE()} name=src_convert_queue'
+        )
+    elif re.match(r'/dev/video\d+', self.input_uri):
         SOURCE_PIPELINE = f'v4l2src device={self.input_uri} ! image/jpeg, framerate=30/1 ! decodebin ! {QUEUE()} ! \
         videoconvert ! {QUEUE()} ! videoscale ! video/x-raw, width={RES_X}, height={RES_Y}, format=RGB ! {QUEUE()} ! videoflip video-direction=horiz ! '
-    elif re.match(r'0x\w+', self.input_uri): # Window ID - get from xwininfo
+    elif re.match(r'0x\w+', self.input_uri):  # Window ID - get from xwininfo
         SOURCE_PIPELINE = f"ximagesrc xid={self.input_uri} ! {QUEUE()} ! videoscale ! "
     else:
         sync = self.sync_req
@@ -87,7 +91,6 @@ def get_pipeline(self):
         {DETECTION_POST_PIPE} ! \
         {QUEUE()}'
 
-
     CLIP_PIPELINE = f'{QUEUE()} name=pre_clip_net ! \
         hailonet hef-path={clip_hef_path} batch-size={batch_size} vdevice-key={DEFAULT_VDEVICE_KEY} \
         multi-process-service=false scheduler-timeout-ms=1000 ! \
@@ -101,12 +104,12 @@ def get_pipeline(self):
     elif self.detector == "face":
         class_id = 2
         crop_function_name = "face_cropper"
-    else: # fast_sam
+    else:  # fast_sam
         class_id = 0
         crop_function_name = "object_cropper"
     TRACKER = f'hailotracker name=hailo_tracker class-id={class_id} kalman-dist-thr=0.8 iou-thr=0.9 init-iou-thr=0.7 \
                 keep-new-frames=2 keep-tracked-frames=15 keep-lost-frames=2 keep-past-metadata=true qos=false ! \
-                {QUEUE()} '
+                {QUEUE()}'
 
     WHOLE_BUFFER_CROP_SO = os.path.join(POSTPROCESS_DIR, "cropping_algorithms/libwhole_buffer.so")
 
@@ -115,7 +118,7 @@ def get_pipeline(self):
         hailoaggregator name=agg1 \
         detection_crop. ! {QUEUE(buffer_size=20, name="detection_bypass_q")} ! agg1.sink_0 \
         detection_crop. ! {DETECTION_PIPELINE} ! agg1.sink_1 \
-        agg1. ! {QUEUE()} '
+        agg1. ! {QUEUE()}'
 
     if self.detector == "none":
         DETECTION_PIPELINE_WRAPPER = ""
@@ -128,13 +131,13 @@ def get_pipeline(self):
         hailoaggregator name=agg \
         cropper. ! {QUEUE(buffer_size=20, name="clip_bypass_q")} ! agg.sink_0 \
         cropper. ! {CLIP_PIPELINE} ! agg.sink_1 \
-        agg. ! {QUEUE()} '
+        agg. ! {QUEUE()}'
 
     # Clip pipeline with muxer integration (no cropper)
     CLIP_MUXER_PIPELINE = f'tee name=clip_t hailomuxer name=clip_hmux \
         clip_t. ! {QUEUE(buffer_size=20, name="clip_bypass_q")} ! clip_hmux.sink_0 \
         clip_t. ! {QUEUE()} ! videoscale n-threads=4 qos=false ! {CLIP_PIPELINE} ! clip_hmux.sink_1 \
-        clip_hmux. ! {QUEUE()} '
+        clip_hmux. ! {QUEUE()}'
 
     # Display pipelines
     CLIP_DISPLAY_PIPELINE = f'{QUEUE()} ! videoconvert n-threads=2 ! \
@@ -155,13 +158,14 @@ def get_pipeline(self):
         PIPELINE = f'{SOURCE_PIPELINE} ! \
         {CLIP_MUXER_PIPELINE} ! \
         {CLIP_POSTPROCESS_PIPELINE} ! \
-	    {CLIP_DISPLAY_PIPELINE}'
+        {CLIP_DISPLAY_PIPELINE}'
     else:
         PIPELINE = f'{SOURCE_PIPELINE} ! \
         {DETECTION_PIPELINE_WRAPPER} ! \
         {TRACKER} ! \
         {CLIP_CROPPER_PIPELINE} ! \
         {CLIP_POSTPROCESS_PIPELINE} ! \
-		{CLIP_DISPLAY_PIPELINE}'
+        {CLIP_DISPLAY_PIPELINE}'
 
     return PIPELINE
+
